@@ -1,0 +1,80 @@
+KOREAN SIGN LANGUAGE ISOLATED-WORD RECOGNITION
+Technical Foundation for IEEE Methodology and Results Sections
+
+Evidence note
+This document is based on the source code, saved model artifacts, split manifests, and training logs present in the workspace, together with the specific final-result figures supplied by the researcher. Statements identified as researcher-supplied have not been independently confirmed by a saved evaluation report in this workspace. No unmeasured latency, hardware specification, or other result is inferred.
+
+1. Project Overview & Objective
+
+The project implements a lightweight, isolated-word Korean Sign Language (KSL) recognition system intended for demonstration through a web application. In the deployed flow, MediaPipe Holistic runs in the browser to extract pose and hand landmarks from webcam frames. A Django JSON API receives a fixed-length feature sequence and uses a PyTorch classifier to predict one of 500 class IDs. If a Korean gloss mapping is installed, the API can return the corresponding word for dictionary-style display.
+
+The system objective is low-latency, privacy-preserving dictionary retrieval: video frames are processed client-side and the application sends extracted numeric landmark features, rather than raw webcam video, to the backend for inference. This design reduces the data transmitted to the server and avoids uploading the captured video in the implemented prediction request. The workspace contains no measured end-to-end latency benchmark, so latency is an intended design goal rather than a quantified result.
+
+2. Dataset & Preprocessing
+
+Source and class selection
+The keypoint archive metadata identifies the source as the AI-Hub Korean sign-language dataset. The cached source archive contains NumPy sequences with an observed example shape of (64, 115, 4), confirming 115 landmarks and four channels in that example. The preprocessing code takes the first 75 landmarks and the first three channels, omitting the fourth channel. The 75-landmark schema used by this system is 33 pose landmarks, 21 left-hand landmarks, and 21 right-hand landmarks; the browser concatenates the same groups in that order. The fourth source channel is omitted; it is treated as the visibility channel per the project specification.
+
+The Top-500 filtering script counts classes in the training split, selects the 500 most frequent class IDs, then filters all three splits to those same IDs. The class mapping in the trained model has 500 contiguous output indices, numbered 0 through 499. Each resulting split contains all 500 classes.
+
+Split sizes and signer independence
+The 500-class split manifests contain:
+  Training:   27,500 samples from 11 signers
+  Validation:  7,500 samples from 3 signers
+  Test:        4,998 samples from 2 signers
+
+Signer IDs are parsed from the AI-Hub-derived filenames. The split-construction and top-class filtering code assign whole signers to a single split and explicitly reject signer overlap. The checked-in 500-class manifests were also inspected: train/validation, train/test, and validation/test have zero signer overlap. Thus the reported test set is signer-independent with respect to the recorded signer IDs. All three manifests contain the same 500 class IDs.
+
+Feature construction
+The offline preprocessing code uses the first 75 landmark rows and x, y, and z channels from each original sequence. It flattens those coordinates in landmark order to 225 position features per frame. For each frame t, it computes a coordinate-wise temporal difference:
+
+  velocity[0] = 0
+  velocity[t] = position[t] - position[t - 1], for t > 0
+
+The 225 position values are concatenated with 225 velocity values, yielding 450 features per frame. There is no shoulder-center subtraction or shoulder-width scaling in the preprocessing code or in the dataset loader. The saved training arrays inspected in the workspace have shape (frames, 450), consistent with already-preprocessed position-and-velocity features.
+
+For model input, the dataset loader converts features to float32, truncates sequences longer than the configured maximum, and zero-pads shorter sequences to 200 frames. The training configuration disables additional velocity computation by default because the Top-500 arrays already have 450 features. Computing velocity again on these arrays would not match the saved model's input.
+
+3. Model Architecture
+
+BiGRU with additive attention
+The deployed checkpoint is the 500-class BiGRU model. Its input has shape (batch, 200, 450). Each frame is projected by a linear layer from 450 features to 256 dimensions and normalized with LayerNorm. A two-layer, bidirectional GRU processes the sequence, with hidden size 256 in each direction and 0.1 inter-layer dropout. Its per-frame outputs therefore have 512 dimensions.
+
+Additive temporal attention maps each 512-dimensional GRU output through a 256-dimensional tanh projection and a scalar scoring layer. A softmax over frames produces attention weights; their weighted sum forms a 512-dimensional sequence representation. A final fully connected layer maps that representation to 500 class logits.
+
+Small Transformer
+The alternative architecture defined in the workspace projects 450-dimensional frames to 256 dimensions, prepends a learned classification (CLS) token, and adds learned positional embeddings for the CLS token and up to 200 frames. It uses a three-layer Transformer encoder with four attention heads, a 1,024-dimensional feed-forward sublayer, batch-first tensors, and dropout 0.1. The encoded CLS representation is passed to a 500-class linear classifier. The project defines this architecture, but the deployed web view loads the BiGRU checkpoint.
+
+4. Training Protocol
+
+The training script uses AdamW and cross-entropy loss with label smoothing set to 0.1. The BiGRU learning rate is 3e-4; the Transformer learning rate is 2e-4. The default batch size is 64, the maximum sequence length is 200 frames, and early stopping monitors validation loss with patience 12. The script's default epoch limit is 100; the recorded BiGRU log shows a 30-epoch run configuration. A fixed seed of 42 is the script default.
+
+The available 500-class training log records CPU as the selected device. The logs do not identify the CPU model, memory, or operating system configuration sufficiently for a detailed hardware specification. These should be added from the actual experiment environment if required by the paper.
+
+Reproducibility caveat: the workspace logs do not document a cleanly completed run matching a final 30-epoch training claim. One log ends at epoch 27/30 without a completion summary. Another 500-class log reports a failure at epoch 4 caused by a file-lock error while saving a temporary checkpoint. The best-model checkpoint exists, but its presence alone does not establish that the logged run completed normally.
+
+5. Final Evaluation Results (Unseen Signers)
+
+The researcher supplied the following final test figures:
+
+  Top-1 Accuracy: 94.42%
+  Top-5 Accuracy: 98.96%
+  Macro F1-Score: 94.35%
+  Model Size: 9.91 MB
+
+The saved BiGRU checkpoint is 9,913,742 bytes, which is 9.91 MB using decimal megabytes (or approximately 9.45 MiB). The test manifest contains 4,998 examples, and the evaluation script implements top-1 accuracy, top-5 accuracy, and macro F1 computation on that held-out split.
+
+Metric provenance: no saved evaluation output containing the three supplied scores was found in the workspace, so those scores are recorded here as researcher-supplied results, not independently verified measurements. The available training logs described above are incomplete or report a save failure. Before presenting the scores as reproducible results, run the current evaluator against the exact saved checkpoint and 500-class manifests, retain its console output, and confirm the checkpoint and manifest versions used. The evaluation code reports the test count, device, model file size, and these metrics.
+
+6. Deployment & Web Application
+
+Backend
+The web application is implemented with Django JSON views. At startup, views.py loads the 500-class BiGRU state dictionary and class mapping. The POST prediction endpoint validates a numeric finite sequence with exact shape (1, 200, 450), performs inference inside torch.inference_mode(), and returns the predicted class ID, class index, confidence, and a word value when the Korean gloss map contains an entry. The endpoint is a Django JSON API; the workspace does not use Django REST Framework.
+
+Frontend and privacy
+The HTML page uses browser-side MediaPipe Holistic to process webcam frames. The JavaScript collects pose, left-hand, and right-hand landmarks in that order, using x, y, and z coordinates. Missing landmark groups are represented by zero coordinates. For each captured frame it appends the 225 coordinate-wise temporal deltas after the 225 positions; the first frame's delta is zero. It pads the temporal sequence to 200 rows and sends the resulting (1, 200, 450) array to the prediction endpoint. The page draws the pose and hand skeleton overlays and displays the returned word (or class ID when no gloss is available) and confidence.
+
+Feature mapping and normalization
+The browser's landmark order and feature layout match the offline preprocessing convention: 33 pose landmarks, followed by 21 left-hand landmarks and 21 right-hand landmarks; three coordinates per landmark; then temporal deltas in the same flattened coordinate order. Both implementations compute frame_t minus frame_(t-1), with a zero delta for the first frame. Neither implementation performs shoulder-center subtraction or shoulder-width scaling. This is deliberate: adding shoulder normalization only in the JavaScript client would make inference features inconsistent with those used to train the existing checkpoint. The coordinate scaling and other extraction details should remain aligned with the particular MediaPipe model and version used when generating the training keypoints.
+
+Only the extracted feature array is posted by the implemented browser request; the raw video is not included in the API payload. A Korean gloss map is an optional runtime asset. If it is absent or does not contain a predicted class, the API can only return the class ID as the displayed fallback. The workspace contains the generator for a gloss map, but the original AI-Hub label metadata needed to populate all 500 Korean words was not present when this document was prepared.

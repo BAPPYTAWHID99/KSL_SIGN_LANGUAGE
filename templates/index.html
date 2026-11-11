@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KSL Sign Recognition Demo</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; }
+    body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #172033; }
+    h1 { margin-bottom: .35rem; }
+    .hint { color: #536078; }
+    #video-stage { position: relative; width: min(100%, 640px); margin: 1rem 0; overflow: hidden; background: #101827; border-radius: 12px; }
+    video { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; }
+    #skeleton { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    button { padding: .8rem 1.1rem; border: 0; border-radius: 8px; background: #174ea6; color: white; font-size: 1rem; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    #status { min-height: 1.5em; color: #3c4658; }
+    #prediction { margin-top: 1rem; padding: 1.25rem; border: 2px solid #d5deeb; border-radius: 10px; }
+    #word { display: block; min-height: 1.5em; color: #123b78; font-size: clamp(2rem, 8vw, 3.5rem); font-weight: 750; }
+    #confidence { display: block; margin-top: .5rem; color: #173d22; font-size: 1.4rem; font-weight: 700; }
+    #class-id { display: block; margin-top: .35rem; color: #536078; }
+  </style>
+</head>
+<body>
+  <h1>KSL Sign Recognition</h1>
+  <p class="hint">Capture a 200-frame sign sequence. Keep your upper body and both hands in view.</p>
+  <div id="video-stage">
+    <video id="camera" autoplay muted playsinline></video>
+    <canvas id="skeleton" aria-hidden="true"></canvas>
+  </div>
+  <button id="capture" type="button">Start camera and capture sign</button>
+  <p id="status" role="status" aria-live="polite">Ready.</p>
+  <section id="prediction" aria-live="polite">
+    <span id="word">Prediction will appear here</span>
+    <span id="confidence"></span>
+    <span id="class-id"></span>
+  </section>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js"></script>
+  <script>
+    const FRAME_COUNT = 200;
+    const LANDMARK_COUNT = 75;
+    const COORDINATE_COUNT = 3;
+    const FEATURE_COUNT = 450;
+    const video = document.getElementById("camera");
+    const canvas = document.getElementById("skeleton");
+    const canvasContext = canvas.getContext("2d");
+    const captureButton = document.getElementById("capture");
+    const statusText = document.getElementById("status");
+    const wordText = document.getElementById("word");
+    const confidenceText = document.getElementById("confidence");
+    const classText = document.getElementById("class-id");
+    let holistic;
+    let camera;
+    let recording = false;
+    let positions = [];
+
+    function landmarksToCoordinates(landmarks, count) {
+      const coordinates = new Array(count * COORDINATE_COUNT).fill(0);
+      if (!landmarks) return coordinates;
+      if (landmarks.length !== count) {
+        throw new Error(`Expected ${count} landmarks, received ${landmarks.length}.`);
+      }
+      landmarks.forEach((point, index) => {
+        coordinates[index * 3] = point.x;
+        coordinates[index * 3 + 1] = point.y;
+        coordinates[index * 3 + 2] = point.z;
+      });
+      return coordinates;
+    }
+
+    function makeFrame(results) {
+      const pose = landmarksToCoordinates(results.poseLandmarks, 33);
+      const leftHand = landmarksToCoordinates(results.leftHandLandmarks, 21);
+      const rightHand = landmarksToCoordinates(results.rightHandLandmarks, 21);
+      const frame = pose.concat(leftHand, rightHand);
+      if (frame.length !== LANDMARK_COUNT * COORDINATE_COUNT) {
+        throw new Error("Landmark extraction did not produce 225 coordinates.");
+      }
+      return frame;
+    }
+
+    function makeFeatures(frames) {
+      const positions = frames.slice(0, FRAME_COUNT);
+      const rows = positions.map((position, frameIndex) => {
+        if (position.length !== LANDMARK_COUNT * COORDINATE_COUNT) {
+          throw new Error(`Expected 225 coordinates, received ${position.length}.`);
+        }
+        const velocity = new Array(position.length).fill(0);
+        if (frameIndex > 0) {
+          for (let feature = 0; feature < position.length; feature += 1) {
+            velocity[feature] = position[feature] - positions[frameIndex - 1][feature];
+          }
+        }
+        const row = position.concat(velocity);
+        if (row.length !== FEATURE_COUNT) {
+          throw new Error(`Expected ${FEATURE_COUNT} features, received ${row.length}.`);
+        }
+        return row;
+      });
+      while (rows.length < FRAME_COUNT) rows.push(new Array(FEATURE_COUNT).fill(0));
+      return [rows.slice(0, FRAME_COUNT)];
+    }
+
+    function drawResults(results) {
+      const width = video.videoWidth || 640;
+      const height = video.videoHeight || 480;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      canvasContext.clearRect(0, 0, width, height);
+      if (results.poseLandmarks) {
+        drawConnectors(canvasContext, results.poseLandmarks, POSE_CONNECTIONS, {
+          color: "#31c46c", lineWidth: 3
+        });
+        drawLandmarks(canvasContext, results.poseLandmarks, {
+          color: "#f5f7fa", lineWidth: 1, radius: 2
+        });
+      }
+      if (results.leftHandLandmarks) {
+        drawConnectors(canvasContext, results.leftHandLandmarks, HAND_CONNECTIONS, {
+          color: "#ff3b30", lineWidth: 3
+        });
+        drawLandmarks(canvasContext, results.leftHandLandmarks, {
+          color: "#ffd1ce", lineWidth: 1, radius: 2
+        });
+      }
+      if (results.rightHandLandmarks) {
+        drawConnectors(canvasContext, results.rightHandLandmarks, HAND_CONNECTIONS, {
+          color: "#1687ff", lineWidth: 3
+        });
+        drawLandmarks(canvasContext, results.rightHandLandmarks, {
+          color: "#c5e1ff", lineWidth: 1, radius: 2
+        });
+      }
+    }
+
+    async function sendForPrediction(frames) {
+      statusText.textContent = "Analyzing the captured sequence…";
+      const response = await fetch("/api/predict/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": decodeURIComponent(
+            document.cookie.split("; ").find((cookie) => cookie.startsWith("csrftoken="))?.split("=")[1] || ""
+          )
+        },
+        body: JSON.stringify({ sequence: makeFeatures(frames) })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Prediction failed (${response.status}).`);
+      wordText.textContent = result.word || result.korean_word || result.class_id;
+      confidenceText.textContent = `${(result.confidence * 100).toFixed(1)}% confidence`;
+      classText.textContent = result.class_id ? `Class ${result.class_id}` : "";
+      statusText.textContent = result.word || result.korean_word
+        ? "Prediction complete."
+        : "Prediction complete. Korean gloss unavailable; showing class ID.";
+    }
+
+    async function onResults(results) {
+      drawResults(results);
+      if (!recording) return;
+      try {
+        positions.push(makeFrame(results));
+        statusText.textContent = `Capturing ${positions.length}/${FRAME_COUNT} frames…`;
+        if (positions.length === FRAME_COUNT) {
+          recording = false;
+          captureButton.disabled = false;
+          await sendForPrediction(positions);
+        }
+      } catch (error) {
+        recording = false;
+        captureButton.disabled = false;
+        statusText.textContent = error.message;
+      }
+    }
+
+    captureButton.addEventListener("click", async () => {
+      if (
+        typeof Holistic === "undefined" ||
+        typeof Camera === "undefined" ||
+        typeof drawConnectors === "undefined" ||
+        typeof drawLandmarks === "undefined"
+      ) {
+        statusText.textContent = "Could not load MediaPipe. Check your internet connection and reload.";
+        return;
+      }
+      captureButton.disabled = true;
+      statusText.textContent = "Starting camera…";
+      wordText.textContent = "Prediction will appear here";
+      confidenceText.textContent = "";
+      classText.textContent = "";
+      try {
+        if (!holistic) {
+          holistic = new Holistic({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`
+          });
+          holistic.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            refineFaceLandmarks: false,
+            enableSegmentation: false,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+          });
+          holistic.onResults(onResults);
+        }
+        if (!camera) {
+          camera = new Camera(video, {
+            onFrame: async () => { await holistic.send({ image: video }); },
+            width: 640,
+            height: 480
+          });
+          await camera.start();
+        }
+        positions = [];
+        recording = true;
+        statusText.textContent = "Show the sign; capturing 200 frames… Missing landmarks are zero-padded.";
+      } catch (error) {
+        recording = false;
+        captureButton.disabled = false;
+        statusText.textContent = `Camera/model startup failed: ${error.message}`;
+      }
+    });
+
+    window.addEventListener("unhandledrejection", (event) => {
+      recording = false;
+      captureButton.disabled = false;
+      statusText.textContent = `Prediction request failed: ${event.reason.message || event.reason}`;
+    });
+  </script>
+</body>
+</html>
